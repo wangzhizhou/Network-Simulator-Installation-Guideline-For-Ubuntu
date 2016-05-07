@@ -1,0 +1,1350 @@
+diff -cNr -x .svn ns-2.35.orig/Makefile.in ns-2.35/Makefile.in
+*** ns-2.35.orig/Makefile.in	2013-08-11 01:52:48.073774659 -0700
+--- ns-2.35/Makefile.in	2013-07-29 00:31:48.543629085 -0700
+***************
+*** 194,199 ****
+--- 194,200 ----
+  	tcp/tcp.o tcp/tcp-sink.o tcp/tcp-reno.o \
+  	tcp/tcp-newreno.o \
+  	tcp/tcp-vegas.o tcp/tcp-rbp.o tcp/tcp-full.o tcp/rq.o \
++ 	tcp/mptcp.o tcp/mptcp-full.o \
+  	baytcp/tcp-full-bay.o baytcp/ftpc.o baytcp/ftps.o \
+  	tcp/scoreboard.o tcp/scoreboard-rq.o tcp/tcp-sack1.o tcp/tcp-fack.o \
+  	tcp/scoreboard1.o tcp/tcp-linux.o tcp/linux/ns-linux-util.o \
+diff -cNr -x .svn ns-2.35.orig/tcp/mptcp.cc ns-2.35/tcp/mptcp.cc
+*** ns-2.35.orig/tcp/mptcp.cc	1969-12-31 16:00:00.000000000 -0800
+--- ns-2.35/tcp/mptcp.cc	2013-08-04 23:19:16.171720823 -0700
+***************
+*** 0 ****
+--- 1,471 ----
++ /*
++  * Copyright (C) 2011 WIDE Project.  All rights reserved.
++  *
++  * Yoshifumi Nishida  <nishida@sfc.wide.ad.jp>
++  *
++  * Redistribution and use in source and binary forms, with or without
++  * modification, are permitted provided that the following conditions
++  * are met:
++  * 1. Redistributions of source code must retain the above copyright
++  *    notice, this list of conditions and the following disclaimer.
++  * 2. Redistributions in binary form must reproduce the above copyright
++  *    notice, this list of conditions and the following disclaimer in the
++  *    documentation and/or other materials provided with the distribution.
++  * 3. Neither the name of the project nor the names of its contributors
++  *    may be used to endorse or promote products derived from this software
++  *    without specific prior written permission.
++  *
++  * THIS SOFTWARE IS PROVIDED BY THE PROJECT AND CONTRIBUTORS ``AS IS'' AND
++  * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++  * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++  * ARE DISCLAIMED.  IN NO EVENT SHALL THE PROJECT OR CONTRIBUTORS BE LIABLE
++  * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++  * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++  * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++  * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++  * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++  * SUCH DAMAGE.
++  */
++ 
++ #include "ip.h"
++ #include "flags.h"
++ #include "random.h"
++ #include "template.h"
++ #include "mptcp.h"
++ 
++ static class MptcpClass:public TclClass
++ {
++ public:
++   MptcpClass ():TclClass ("Agent/MPTCP")
++   {
++   }
++   TclObject *create (int, const char *const *)
++   {
++     return (new MptcpAgent ());
++   }
++ }
++ 
++ class_mptcp;
++ 
++ MptcpAgent::MptcpAgent ():Agent (PT_TCP), sub_num_ (0), total_bytes_ (0),
++ mcurseq_ (1), mackno_ (1), infinite_send_(false)
++ {
++ }
++ 
++ void
++ MptcpAgent::delay_bind_init_all ()
++ {
++   Agent::delay_bind_init_all ();
++ }
++ 
++ /* haven't implemented yet */
++ #if 0
++ int
++ MptcpAgent::delay_bind_dispatch (const char *cpVarName,
++                                  const char *cpLocalName,
++                                  TclObject * opTracer)
++ {
++   return Agent::delay_bind_dispatch (cpVarName, cpLocalName, opTracer);
++ }
++ 
++ void
++ MptcpAgent::TraceAll ()
++ {
++ }
++ 
++ void
++ MptcpAgent::TraceVar (const char *cpVar)
++ {
++ }
++ 
++ void
++ MptcpAgent::trace (TracedVar * v)
++ {
++   if (eTraceAll == TRUE)
++     TraceAll ();
++   else
++     TraceVar (v->name ());
++ }
++ #endif
++ 
++ int
++ MptcpAgent::command (int argc, const char *const *argv)
++ {
++   if (argc == 2) {
++     if (strcmp (argv[1], "listen") == 0) {
++       for (int i = 0; i < sub_num_; i++) {
++         if (subflows_[i].tcp_->command (argc, argv) != TCL_OK)
++           return (TCL_ERROR);
++       }
++       return (TCL_OK);
++     }
++     if (strcmp (argv[1], "reset") == 0) {
++ 
++       /* reset used flag information */
++       bool used_dst[dst_num_];
++       for (int j = 0; j < dst_num_; j++) used_dst[j] = false;
++ 
++       for (int i = 0; i < sub_num_; i++) {
++         for (int j = 0; j < dst_num_; j++) {
++ 
++           /* if this destination is already used by other subflow, don't use it */
++           if (used_dst[j]) continue;
++ 
++           if (check_routable (i, dsts_[j].addr_, dsts_[j].port_)) {
++             subflows_[i].daddr_ = dsts_[j].addr_;
++             subflows_[i].dport_ = dsts_[j].port_;
++             subflows_[i].tcp_->daddr () = dsts_[j].addr_;
++             subflows_[i].tcp_->dport () = dsts_[j].port_;
++             used_dst[j] = true; 
++             break;
++           }
++         }
++       }
++       subflows_[0].tcp_->mptcp_set_primary ();
++       return (TCL_OK);
++     }
++   }
++   if (argc == 3) {
++     if (strcmp (argv[1], "attach-tcp") == 0) {
++       int id = get_subnum ();
++       subflows_[id].tcp_ = (MpFullTcpAgent *) TclObject::lookup (argv[2]);
++       subflows_[id].used = true;
++       subflows_[id].addr_ = subflows_[id].tcp_->addr ();
++       subflows_[id].port_ = subflows_[id].tcp_->port ();
++       subflows_[id].tcp_->mptcp_set_core (this);
++       sub_num_++;
++       return (TCL_OK);
++     }
++     else if (strcmp (argv[1], "set-multihome-core") == 0) {
++       core_ = (Classifier *) TclObject::lookup (argv[2]);
++       if (core_ == NULL) {
++         return (TCL_ERROR);
++       }
++       return (TCL_OK);
++     }
++   }
++   if (argc == 4) {
++     if (strcmp (argv[1], "add-multihome-destination") == 0) {
++       add_destination (atoi (argv[2]), atoi (argv[3]));
++       return (TCL_OK);
++     }
++   }
++   if (argc == 6) {
++     if (strcmp (argv[1], "add-multihome-interface") == 0) {
++       /* argv[2] indicates the addresses of the mptcp session */
++ 
++       /* find the id for tcp bound to this address */
++       int id = find_subflow (atoi (argv[2]));
++       if (id < 0) {
++         fprintf (stderr, "cannot find tcp bound to interface addr [%s]",
++                  argv[2]);
++         return (TCL_ERROR);
++       }
++       subflows_[id].tcp_->port () = atoi (argv[3]);
++       subflows_[id].port_ = atoi (argv[3]);
++       subflows_[id].target_ = (NsObject *) TclObject::lookup (argv[4]);
++       subflows_[id].link_ = (NsObject *) TclObject::lookup (argv[5]);
++       if (subflows_[id].target_ == NULL || subflows_[id].link_ == NULL)
++         return (TCL_ERROR);
++ 
++       return (TCL_OK);
++     }
++   }
++   return (Agent::command (argc, argv));
++ }
++ 
++ int
++ MptcpAgent::get_subnum ()
++ {
++   for (int i = 0; i < MAX_SUBFLOW; i++) {
++     if (!subflows_[i].used)
++       return i;
++   }
++   return -1;
++ }
++ 
++ int
++ MptcpAgent::find_subflow (int addr, int port)
++ {
++   for (int i = 0; i < MAX_SUBFLOW; i++) {
++     if (subflows_[i].addr_ == addr && subflows_[i].port_ == port)
++       return i;
++   }
++   return -1;
++ }
++ 
++ int
++ MptcpAgent::find_subflow (int addr)
++ {
++   for (int i = 0; i < MAX_SUBFLOW; i++) {
++     if (subflows_[i].addr_ == addr)
++       return i;
++   }
++   return -1;
++ }
++ 
++ void
++ MptcpAgent::recv (Packet * pkt, Handler * h)
++ {
++   hdr_ip *iph = hdr_ip::access (pkt);
++   hdr_tcp *tcph = hdr_tcp::access (pkt);
++ 
++   /* find subflow id from the destination address */
++   int id = find_subflow (iph->daddr ());
++   if (id < 0) {
++     fprintf (stderr,
++              "MptcpAgent:recv() fatal error. cannot find destination\n");
++     abort ();
++   }
++ 
++   /* processing mptcp options */
++   if (tcph->mp_capable ()) {
++     /* if we receive mpcapable option, return the same option as response */
++     subflows_[id].tcp_->mpcapable_ = true;
++   }
++   if (tcph->mp_join ()) {
++     /* if we receive mpjoin option, return the same option as response */
++     subflows_[id].tcp_->mpjoin_ = true;
++   }
++   if (tcph->mp_ack ()) {
++     /* when we receive mpack, erase the acked record */
++     subflows_[id].tcp_->mptcp_remove_mapping (tcph->mp_ack ());
++   }
++ 
++   if (tcph->mp_dsn ()) {
++     /* when we receive mpdata, update new mapping */
++     subflows_[id].tcp_->mpack_ = true;
++     subflows_[id].tcp_->mptcp_recv_add_mapping (tcph->mp_dsn (),
++                                                 tcph->mp_subseq (),
++                                                 tcph->mp_dsnlen ());
++   }
++ 
++   /* make sure packet will be return to the src addr of the packet */
++   subflows_[id].tcp_->daddr () = iph->saddr ();
++   subflows_[id].tcp_->dport () = iph->sport ();
++ 
++   /* call subflow's recv function */
++   subflows_[id].tcp_->recv (pkt, h);
++ 
++   send_control ();
++ }
++ 
++ /*
++  * add possible destination address
++  */
++ void
++ MptcpAgent::add_destination (int addr, int port)
++ {
++   for (int i = 0; i < MAX_SUBFLOW; i++) {
++     if (dsts_[i].active_)
++       continue;
++     dsts_[i].addr_ = addr;
++     dsts_[i].port_ = port;
++     dsts_[i].active_ = true;
++     dst_num_++;
++     return;
++   }
++   fprintf (stderr, "fatal error. cannot add destination\n");
++   abort ();
++ }
++ 
++ /*
++  * check if this subflow can reach to the specified address
++  */
++ bool
++ MptcpAgent::check_routable (int sid, int addr, int port)
++ {
++   Packet *p = allocpkt ();
++   hdr_ip *iph = hdr_ip::access (p);
++   iph->daddr () = addr;
++   iph->dport () = port;
++   bool
++     result = (static_cast < Classifier * >
++               (subflows_[sid].target_)->classify (p) > 0) ? true : false;
++   Packet::free (p);
++ 
++   return result;
++ }
++ 
++ void
++ MptcpAgent::sendmsg (int nbytes, const char * /*flags */ )
++ {
++   if (nbytes == -1) {
++     infinite_send_ = true;
++     total_bytes_ = TCP_MAXSEQ;
++   } else
++     total_bytes_ = nbytes;
++   send_control ();
++ }
++ 
++ /*
++  * control sending data
++  */
++ void
++ MptcpAgent::send_control ()
++ {
++   if (total_bytes_ > 0 && infinite_send_) {
++     /* one round */
++     bool slow_start = false;
++     for (int i = 0; i < sub_num_; i++) {
++ 
++       int mss = subflows_[i].tcp_->size ();
++       double cwnd = subflows_[i].tcp_->mptcp_get_cwnd () * mss;
++       int ssthresh = subflows_[i].tcp_->mptcp_get_ssthresh () * mss;
++       int maxseq = subflows_[i].tcp_->mptcp_get_maxseq ();
++       int backoff = subflows_[i].tcp_->mptcp_get_backoff ();
++       int highest_ack = subflows_[i].tcp_->mptcp_get_highest_ack ();
++       int dupacks = subflows_[i].tcp_->mptcp_get_numdupacks();
++ 
++ #if 1
++ 	  // we don't utlize a path which has lots of timeouts
++       if (backoff >= 4) continue;
++ #endif
++ 
++       /* too naive logic to calculate outstanding bytes? */
++       int outstanding = maxseq - highest_ack - dupacks * mss;
++       if (outstanding <= 0) outstanding = 0;
++ 
++       if (cwnd < ssthresh) {
++         /* allow only one subflow to do slow start at the same time */
++         if (!slow_start) {
++           slow_start = true;
++           subflows_[i].tcp_->mptcp_set_slowstart (true);
++         }
++         else
++ #if 0
++           subflows_[i].tcp_->mptcp_set_slowstart (false);
++ #else
++           /* allow to do slow-start simultaneously */
++           subflows_[i].tcp_->mptcp_set_slowstart (true);
++ #endif
++       }
++ 
++       int sendbytes = cwnd - outstanding;
++       if (sendbytes < mss)
++         continue;
++       if (sendbytes > total_bytes_)
++         sendbytes = total_bytes_;
++ 
++       if (sendbytes > mss) sendbytes = mss;
++ 
++       subflows_[i].tcp_->mptcp_add_mapping (mcurseq_, sendbytes);
++       subflows_[i].tcp_->sendmsg (sendbytes);
++       mcurseq_ += sendbytes;
++ 
++ 	  if (!infinite_send_)
++         total_bytes_ -= sendbytes;
++ 
++ #if 0
++       if (!slow_start) {
++          double cwnd_i = subflows_[i].tcp_->mptcp_get_cwnd ();
++          /*
++             As recommended in 4.1 of draft-ietf-mptcp-congestion-05
++             Update alpha only if cwnd_i/mss_i != cwnd_new_i/mss_i.
++          */
++          if (abs(subflows_[i].tcp_->mptcp_get_last_cwnd () - cwnd_i) < 1) {
++             calculate_alpha ();
++          }
++          subflows_[i].tcp_->mptcp_set_last_cwnd (cwnd_i);
++       }
++ #endif
++     }
++   }
++ }
++ 
++ /*
++  *  calculate alpha based on the equation in draft-ietf-mptcp-congestion-05
++  *
++  *  Peforme ths following calculation
++ 
++                                       cwnd_i
++                                  max --------
++                                   i         2
++                                       rtt_i
++              alpha = tot_cwnd * ----------------
++                                /      cwnd_i \ 2
++                                | sum ---------|
++                                \  i   rtt_i  /
++ 
++ 
++  */
++ 
++ void
++ MptcpAgent::calculate_alpha ()
++ {
++   double max_i = 0.001;
++   double sum_i = 0;
++   double avr_i = 0;
++   int totalcwnd = 0;
++ 
++   for (int i = 0; i < sub_num_; i++) {
++ #if 1
++     int backoff = subflows_[i].tcp_->mptcp_get_backoff ();
++     // we don't utlize a path which has lots of timeouts
++     if (backoff >= 4) 
++        continue;
++ #endif
++ 
++     double rtt_i  = subflows_[i].tcp_->mptcp_get_srtt ();
++     int cwnd_i = (int)subflows_[i].tcp_->mptcp_get_cwnd ();
++ 
++     if (rtt_i < 0.000001) // too small. Let's not update alpha
++       return; 
++ 
++     double tmp_i = cwnd_i / (rtt_i * rtt_i);
++     if (max_i < tmp_i)
++       max_i = tmp_i;
++     avr_i += tmp_i;
++ 
++     sum_i += cwnd_i / rtt_i;
++     totalcwnd += cwnd_i;
++   }
++   if (sum_i < 0.001)
++     return;
++ 
++   alpha_ = totalcwnd * max_i / (sum_i * sum_i);
++ }
++ 
++ /*
++  * create ack block based on data ack information
++  */
++ void
++ MptcpAgent::set_dataack (int ackno, int length)
++ {
++   bool found = false;
++   vector < dack_mapping >::iterator it = dackmap_.begin ();
++ 
++   while (it != dackmap_.end ()) {
++     struct dack_mapping *p = &*it;
++ 
++     /* find matched block for this data */
++     if (p->ackno <= ackno && p->ackno + p->length >= ackno &&
++         p->ackno + p->length < ackno + length) {
++       p->length = ackno + length - p->ackno;
++       found = true;
++       break;
++     }
++     else
++       ++it;
++   }
++ 
++   /* if there's no matching block, add new one */
++   if (!found) {
++     struct dack_mapping tmp_map = { ackno, length };
++     dackmap_.push_back (tmp_map);
++   }
++ 
++   /* re-calculate cumlative ack and erase old records */
++   it = dackmap_.begin ();
++   while (it != dackmap_.end ()) {
++     struct dack_mapping *p = &*it;
++     if (mackno_ >= p->ackno && mackno_ <= p->ackno + p->length)
++       mackno_ = ackno + length;
++     if (mackno_ > p->ackno + p->length) {
++       it = dackmap_.erase (it);
++     }
++     else
++       ++it;
++   }
++ }
+diff -cNr -x .svn ns-2.35.orig/tcp/mptcp-full.cc ns-2.35/tcp/mptcp-full.cc
+*** ns-2.35.orig/tcp/mptcp-full.cc	1969-12-31 16:00:00.000000000 -0800
+--- ns-2.35/tcp/mptcp-full.cc	2013-07-29 00:32:52.043631719 -0700
+***************
+*** 0 ****
+--- 1,407 ----
++ /*
++  * Copyright (C) 2011 WIDE Project.  All rights reserved.
++  *
++  * Yoshifumi Nishida  <nishida@sfc.wide.ad.jp>
++  *
++  * Redistribution and use in source and binary forms, with or without
++  * modification, are permitted provided that the following conditions
++  * are met:
++  * 1. Redistributions of source code must retain the above copyright
++  *    notice, this list of conditions and the following disclaimer.
++  * 2. Redistributions in binary form must reproduce the above copyright
++  *    notice, this list of conditions and the following disclaimer in the
++  *    documentation and/or other materials provided with the distribution.
++  * 3. Neither the name of the project nor the names of its contributors
++  *    may be used to endorse or promote products derived from this software
++  *    without specific prior written permission.
++  *
++  * THIS SOFTWARE IS PROVIDED BY THE PROJECT AND CONTRIBUTORS ``AS IS'' AND
++  * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++  * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++  * ARE DISCLAIMED.  IN NO EVENT SHALL THE PROJECT OR CONTRIBUTORS BE LIABLE
++  * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++  * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++  * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++  * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++  * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++  * SUCH DAMAGE.
++  */
++ 
++ #include "ip.h"
++ #include "tcp-full.h"
++ #include "mptcp-full.h"
++ #include "flags.h"
++ #include "random.h"
++ #include "template.h"
++ #include "mptcp.h"
++ 
++ #ifndef TRUE
++ #define	TRUE 	1
++ #endif
++ 
++ #ifndef FALSE
++ #define	FALSE 	0
++ #endif
++ 
++ static class MpFullTcpClass:public TclClass
++ {
++ public:
++   MpFullTcpClass ():TclClass ("Agent/TCP/FullTcp/Sack/Multipath")
++   {
++   }
++   TclObject *create (int, const char *const *)
++   {
++     return (new MpFullTcpAgent ());
++   }
++ }
++ 
++ class_mpfull;
++ 
++ void
++ MpFullTcpAgent::prpkt (Packet * pkt)
++ {
++   hdr_tcp *tcph = hdr_tcp::access (pkt);        // TCP header
++   hdr_cmn *th = hdr_cmn::access (pkt);  // common header (size, etc)
++   //hdr_flags *fh = hdr_flags::access(pkt);       // flags (CWR, CE, bits)
++   hdr_ip *iph = hdr_ip::access (pkt);
++   int datalen = th->size () - tcph->hlen ();    // # payload bytes
++ 
++   fprintf (stdout,
++            " [%d:%d.%d>%d.%d] (hlen:%d, dlen:%d, seq:%d, ack:%d, flags:0x%x (%s), salen:%d, reason:0x%x)\n",
++            th->uid (), iph->saddr (), iph->sport (), iph->daddr (),
++            iph->dport (), tcph->hlen (), datalen, tcph->seqno (),
++            tcph->ackno (), tcph->flags (), flagstr (tcph->flags ()),
++            tcph->sa_length (), tcph->reason ());
++ }
++ 
++ /*
++  * this function should be virtual so others (e.g. SACK) can override
++  */
++ int
++ MpFullTcpAgent::headersize ()
++ {
++   int total = tcpip_base_hdr_size_;
++   if (total < 1) {
++     fprintf (stderr,
++              "%f: MpFullTcpAgent(%s): warning: tcpip hdr size is only %d bytes\n",
++              now (), name (), tcpip_base_hdr_size_);
++   }
++ 
++   if (ts_option_)
++     total += ts_option_size_;
++ 
++   total += mptcp_option_size_;
++ 
++   return (total);
++ }
++ 
++ /*
++  * sendpacket: 
++  *	allocate a packet, fill in header fields, and send
++  *	also keeps stats on # of data pkts, acks, re-xmits, etc
++  *
++  * fill in packet fields.  Agent::allocpkt() fills
++  * in most of the network layer fields for us.
++  * So fill in tcp hdr and adjust the packet size.
++  *
++  * Also, set the size of the tcp header.
++  */
++ void
++ MpFullTcpAgent::sendpacket (int seqno, int ackno, int pflags, int datalen,
++                             int reason, Packet * p)
++ {
++   if (!p)
++     p = allocpkt ();
++   hdr_tcp *tcph = hdr_tcp::access (p);
++   hdr_flags *fh = hdr_flags::access (p);
++ 
++   /* build basic header w/options */
++ 
++   tcph->seqno () = seqno;
++   tcph->ackno () = ackno;
++   tcph->flags () = pflags;
++   tcph->reason () |= reason;    // make tcph->reason look like ns1 pkt->flags?
++   tcph->sa_length () = 0;       // may be increased by build_options()
++   tcph->hlen () = tcpip_base_hdr_size_;
++   tcph->hlen () += build_options (tcph);
++ 
++   /*
++    * Explicit Congestion Notification (ECN) related:
++    * Bits in header:
++    *      ECT (EC Capable Transport),
++    *      ECNECHO (ECHO of ECN Notification generated at router),
++    *      CWR (Congestion Window Reduced from RFC 2481)
++    * States in TCP:
++    *      ecn_: I am supposed to do ECN if my peer does
++    *      ect_: I am doing ECN (ecn_ should be T and peer does ECN)
++    */
++ 
++   if (datalen > 0 && ecn_) {
++     // set ect on data packets 
++     fh->ect () = ect_;          // on after mutual agreement on ECT
++   }
++   else if (ecn_ && ecn_syn_ && ecn_syn_next_ && (pflags & TH_SYN)
++            && (pflags & TH_ACK)) {
++     // set ect on syn/ack packet, if syn packet was negotiating ECT
++     fh->ect () = ect_;
++   }
++   else {
++     /* Set ect() to 0.  -M. Weigle 1/19/05 */
++     fh->ect () = 0;
++   }
++   if (ecn_ && ect_ && recent_ce_) {
++     // This is needed here for the ACK in a SYN, SYN/ACK, ACK
++     // sequence.
++     pflags |= TH_ECE;
++   }
++   // fill in CWR and ECE bits which don't actually sit in
++   // the tcp_flags but in hdr_flags
++   if (pflags & TH_ECE) {
++     fh->ecnecho () = 1;
++   }
++   else {
++     fh->ecnecho () = 0;
++   }
++   if (pflags & TH_CWR) {
++     fh->cong_action () = 1;
++   }
++   else {
++     /* Set cong_action() to 0  -M. Weigle 1/19/05 */
++     fh->cong_action () = 0;
++   }
++ 
++   /*
++    * mptcp processing
++    */
++   mptcp_option_size_ = 0;
++   if (pflags & TH_SYN) {
++     if (!(pflags & TH_ACK)) {
++       if (mptcp_is_primary ()) {
++         tcph->mp_capable () = 1;
++         mptcp_option_size_ += MPTCP_CAPABLEOPTION_SIZE;
++       }
++       else {
++         tcph->mp_join () = 1;
++         mptcp_option_size_ += MPTCP_JOINOPTION_SIZE;
++       }
++     }
++     else {
++       if (mpcapable_) {
++         tcph->mp_capable () = 1;
++         mptcp_option_size_ += MPTCP_CAPABLEOPTION_SIZE;
++       }
++       if (mpjoin_) {
++         tcph->mp_join () = 1;
++         mptcp_option_size_ += MPTCP_JOINOPTION_SIZE;
++       }
++     }
++   }
++   else {
++     tcph->mp_ack () = mptcp_recv_getack (ackno);
++     if (tcph->mp_ack ())
++       mptcp_option_size_ += MPTCP_ACKOPTION_SIZE;
++   }
++ 
++   if (datalen && !mptcp_dsnmap_.empty ()) {
++     vector < dsn_mapping >::iterator it;
++     for (it = mptcp_dsnmap_.begin (); it != mptcp_dsnmap_.end (); ++it) {
++       struct dsn_mapping *p = &*it;
++ 
++       /* 
++          check if this is the mapping for this packet 
++          if so, attach the mapping info to the packet 
++        */
++       if (seqno >= p->sseqnum && seqno < p->sseqnum + p->length) {
++         /* 
++            if this is first transssion for this mapping or
++            if this is retransmited packet, attach mapping 
++          */
++         if (!p->sentseq || p->sentseq == seqno) {
++           tcph->mp_dsn () = p->dseqnum;
++           tcph->mp_subseq () = p->sseqnum;
++           tcph->mp_dsnlen () = p->length;
++           p->sentseq = seqno;
++           mptcp_option_size_ += MPTCP_DATAOPTION_SIZE;
++           break;
++         }
++       }
++     }
++   }
++   tcph->hlen () += mptcp_option_size_;
++ 
++   /* actual size is data length plus header length */
++ 
++   hdr_cmn *ch = hdr_cmn::access (p);
++   ch->size () = datalen + tcph->hlen ();
++ 
++   if (datalen <= 0)
++     ++nackpack_;
++   else {
++     ++ndatapack_;
++     ndatabytes_ += datalen;
++     last_send_time_ = now ();   // time of last data
++   }
++   if (reason == REASON_TIMEOUT || reason == REASON_DUPACK
++       || reason == REASON_SACK) {
++     ++nrexmitpack_;
++     nrexmitbytes_ += datalen;
++   }
++ 
++   last_ack_sent_ = ackno;
++ 
++ //if (state_ != TCPS_ESTABLISHED) {
++ //printf("MP %f(%s)[state:%s]: sending pkt ", now(), name(), statestr(state_));
++ //prpkt(p);
++ //}
++ 
++   send (p, 0);
++ 
++   return;
++ }
++ 
++ void
++ MpFullTcpAgent::mptcp_set_core (MptcpAgent * core)
++ {
++   mptcp_core_ = core;
++ }
++ 
++ void
++ MpFullTcpAgent::mptcp_add_mapping (int dseqnum, int length)
++ {
++   int sseqnum = (int) curseq_ + 1;
++   struct dsn_mapping tmp_map (dseqnum, sseqnum, length);
++   mptcp_dsnmap_.push_back (tmp_map);
++ }
++ 
++ void
++ MpFullTcpAgent::mptcp_recv_add_mapping (int dseqnum, int sseqnum, int length)
++ {
++   struct dsn_mapping tmp_map (dseqnum, sseqnum, length);
++   mptcp_recv_dsnmap_.push_back (tmp_map);
++ }
++ 
++ /*
++  * return dsn for mptcp from subseqnum
++  */
++ int
++ MpFullTcpAgent::mptcp_recv_getack (int ackno)
++ {
++   if (ackno == 1)
++     return 0;                   /* we don't receive any data */
++   vector < dsn_mapping >::iterator it = mptcp_recv_dsnmap_.begin ();
++   while (it != mptcp_recv_dsnmap_.end ()) {
++     struct dsn_mapping *p = &*it;
++ 
++     /* check if this is the mapping for this packet */
++     if (ackno >= p->sseqnum && ackno <= p->sseqnum + p->length) {
++       int offset = ackno - p->sseqnum;
++ 
++       mptcp_core_->set_dataack (p->dseqnum, offset);
++       return mptcp_core_->get_dataack ();
++     }
++     if (ackno > p->sseqnum + p->length) {
++       it = mptcp_recv_dsnmap_.erase (it);
++     }
++     else
++       ++it;
++   }
++   fprintf (stderr, "fatal. no mapping info was found. ackno %d\n", ackno);
++   abort ();
++ }
++ 
++ void
++ MpFullTcpAgent::mptcp_remove_mapping (int seqnum)
++ {
++   vector < dsn_mapping >::iterator it;
++   for (it = mptcp_dsnmap_.begin (); it != mptcp_dsnmap_.end (); ++it) {
++     struct dsn_mapping *p = &*it;
++ 
++     if (seqnum > p->dseqnum + p->length) {
++       it = mptcp_dsnmap_.erase (it);
++       return;
++     }
++   }
++ }
++ 
++ /*
++  * open up the congestion window based on linked increase algorithm
++  * in draft-ietf-mptcp-congestion-05
++ 
++    The logic in the draft is: 
++      For each ack received on subflow i, increase cwnd_i by min
++      (alpha*bytes_acked*mss_i/tot_cwnd , bytes_acked*mss_i/cwnd_i )
++    
++    Since ns-2's congestion control logic is packet base, the logic 
++    in here is rather simplified. Please note the following difference from
++    the original one.
++      o we don't use bytes_acked. use 1 packet size instead.
++      o we don't use mss_i. use 1 packet size instead.
++  *
++  */
++ void
++ MpFullTcpAgent::opencwnd ()
++ {
++   // calculate alpha here
++   mptcp_core_->calculate_alpha ();
++ 
++   double increment;
++   if (cwnd_ < ssthresh_ && mptcp_allow_slowstart_) {
++     /* slow-start (exponential) */
++     cwnd_ += 1;
++   }
++   else {
++ #if 1
++     double alpha = mptcp_core_->get_alpha ();
++     double totalcwnd = mptcp_core_->get_totalcwnd ();
++     if (totalcwnd > 0.1) {
++ 
++       // original increase logic 
++       double oincrement = increase_num_ / cwnd_;
++       /*
++         Subflow i will increase by alpha*cwnd_i/tot_cwnd segments per RTT.
++       */
++       increment = increase_num_ / cwnd_ * (cwnd_ / totalcwnd) * alpha;
++       //increment = increase_num_ / cwnd_ * (cwnd_ / totalcwnd) * 0.5;
++ 
++       /*
++         we ensure that any multipath subflow cannot be more aggressive
++         than a TCP flow in the same circumstances 
++       */
++       if (oincrement < increment) 
++          increment = oincrement;
++     } else
++ #endif
++     // original increase logic
++     increment = increase_num_ / cwnd_;
++ 
++     if ((last_cwnd_action_ == 0 || last_cwnd_action_ == CWND_ACTION_TIMEOUT)
++         && max_ssthresh_ > 0) {
++       increment = limited_slow_start (cwnd_, max_ssthresh_, increment);
++     }
++     cwnd_ += increment;
++   }
++   // if maxcwnd_ is set (nonzero), make it the cwnd limit
++   if (maxcwnd_ && (int (cwnd_) > maxcwnd_))
++     cwnd_ = maxcwnd_;
++ 
++   return;
++ }
++ 
++ void
++ MpFullTcpAgent::timeout_action()
++ {
++   SackFullTcpAgent::timeout_action();
++ 
++   // calculate alpha here
++   mptcp_core_->calculate_alpha ();
++ }
++ 
++ void
++ MpFullTcpAgent::dupack_action()
++ {
++   SackFullTcpAgent::dupack_action();
++ 
++   // calculate alpha here
++   mptcp_core_->calculate_alpha ();
++ }
+diff -cNr -x .svn ns-2.35.orig/tcp/mptcp-full.h ns-2.35/tcp/mptcp-full.h
+*** ns-2.35.orig/tcp/mptcp-full.h	1969-12-31 16:00:00.000000000 -0800
+--- ns-2.35/tcp/mptcp-full.h	2013-07-29 00:32:55.463631861 -0700
+***************
+*** 0 ****
+--- 1,156 ----
++ /*
++  * Copyright (C) 2011 WIDE Project.  All rights reserved.
++  *
++  * Yoshifumi Nishida  <nishida@sfc.wide.ad.jp>
++  *
++  * Redistribution and use in source and binary forms, with or without
++  * modification, are permitted provided that the following conditions
++  * are met:
++  * 1. Redistributions of source code must retain the above copyright
++  *    notice, this list of conditions and the following disclaimer.
++  * 2. Redistributions in binary form must reproduce the above copyright
++  *    notice, this list of conditions and the following disclaimer in the
++  *    documentation and/or other materials provided with the distribution.
++  * 3. Neither the name of the project nor the names of its contributors
++  *    may be used to endorse or promote products derived from this software
++  *    without specific prior written permission.
++  *
++  * THIS SOFTWARE IS PROVIDED BY THE PROJECT AND CONTRIBUTORS ``AS IS'' AND
++  * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++  * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++  * ARE DISCLAIMED.  IN NO EVENT SHALL THE PROJECT OR CONTRIBUTORS BE LIABLE
++  * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++  * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++  * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++  * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++  * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++  * SUCH DAMAGE.
++  */
++ 
++ #ifndef ns_mptcp_full_h
++ #define ns_mptcp_full_h
++ 
++ #include "tcp.h"
++ #include "rq.h"
++ #include "tcp-full.h"
++ 
++ #include <vector>
++ class MptcpAgent;
++ struct dsn_mapping
++ {
++   dsn_mapping (int dseq, int curseq, int len):sentseq (0)
++   {
++     dseqnum = dseq;
++     sseqnum = curseq;
++     length = len;
++   }
++   int sseqnum;
++   int dseqnum;
++   int length;
++   int sentseq;
++ };
++ 
++ const int MPTCP_CAPABLEOPTION_SIZE = 12;
++ const int MPTCP_JOINOPTION_SIZE = 7;
++ const int MPTCP_ACKOPTION_SIZE = 10;
++ const int MPTCP_DATAOPTION_SIZE = 16;
++ 
++ class MpFullTcpAgent;
++ 
++ class MpFullTcpAgent:public SackFullTcpAgent
++ {
++ public:
++   MpFullTcpAgent ():mptcp_core_ (NULL), mptcp_primary_ (false),
++     mptcp_allow_slowstart_ (true), mptcp_last_cwnd_(0)
++   {
++   }
++ 
++   /* multipath TCP */
++   double mptcp_get_cwnd ()
++   {
++     if (fastrecov_){
++         /* use ssthresh value for flows in fast retransmit
++            see Section 3 for draft-ietf-mptcp-congestion-05 */
++         return (double) ssthresh_;
++     }
++     return (double) cwnd_;
++   }
++   double mptcp_get_last_cwnd() 
++   {
++     return mptcp_last_cwnd_;
++   }
++   void mptcp_set_last_cwnd(double cwnd_) 
++   {
++     mptcp_last_cwnd_ = cwnd_;
++   }
++   int mptcp_get_ssthresh ()
++   {
++     return (int) ssthresh_;
++   }
++   int mptcp_get_maxseq ()
++   {
++     return (int) maxseq_;
++   }
++   int mptcp_get_highest_ack ()
++   {
++     return (int) highest_ack_;
++   }
++   double mptcp_get_srtt ()
++   {
++     return (double) ((t_srtt_ >> T_SRTT_BITS) * tcp_tick_);
++   }
++   double mptcp_get_backoff ()
++   {
++     return (int) t_backoff_;
++   }
++   int mptcp_get_numdupacks ()
++   {
++     return (int) dupacks_;
++   }
++ 
++   void mptcp_set_core (MptcpAgent *);
++   void mptcp_set_primary ()
++   {
++     mptcp_primary_ = true;
++   }
++   void mptcp_add_mapping (int dseqnum, int length);
++   void mptcp_recv_add_mapping (int dseqnum, int sseqnum, int length);
++   void mptcp_remove_mapping (int seqnum);
++   void mptcp_set_slowstart (bool value)
++   {
++     mptcp_allow_slowstart_ = value;
++   }
++   int mptcp_recv_getack (int acknow);
++   bool mptcp_is_primary ()
++   {
++     return mptcp_primary_;
++   }
++   bool mpcapable_;
++   bool mpjoin_;
++   bool mpdata_;
++   bool mpaddr_;
++   bool mpack_;
++ protected:
++   void opencwnd ();
++   void dupack_action ();
++   void timeout_action ();
++   int headersize ();            // a tcp header w/opts
++   virtual void sendpacket (int seq, int ack, int flags, int dlen, int why,
++                            Packet * p = 0);
++   void prpkt (Packet *);        // print packet (debugging helper)
++ 
++   /* multipath TCP */
++   MptcpAgent *mptcp_core_;
++   bool mptcp_primary_;
++   bool mptcp_allow_slowstart_;
++   int mptcp_prev_ackno_;     // previous highest ack 
++   int mptcp_prev_sqminseq_;  // previous minseq in sack block
++   int mptcp_prev_sqtotal_;   // previous total bytes in sack blocks
++   int mptcp_option_size_;
++   int mptcp_last_cwnd_;
++   vector < dsn_mapping > mptcp_dsnmap_;
++   vector < dsn_mapping > mptcp_recv_dsnmap_;
++ };
++ 
++ #endif
+diff -cNr -x .svn ns-2.35.orig/tcp/mptcp.h ns-2.35/tcp/mptcp.h
+*** ns-2.35.orig/tcp/mptcp.h	1969-12-31 16:00:00.000000000 -0800
+--- ns-2.35/tcp/mptcp.h	2013-08-04 23:16:36.339714199 -0700
+***************
+*** 0 ****
+--- 1,125 ----
++ /*
++  * Copyright (C) 2011 WIDE Project.  All rights reserved.
++  *
++  * Yoshifumi Nishida  <nishida@sfc.wide.ad.jp>
++  *
++  * Redistribution and use in source and binary forms, with or without
++  * modification, are permitted provided that the following conditions
++  * are met:
++  * 1. Redistributions of source code must retain the above copyright
++  *    notice, this list of conditions and the following disclaimer.
++  * 2. Redistributions in binary form must reproduce the above copyright
++  *    notice, this list of conditions and the following disclaimer in the
++  *    documentation and/or other materials provided with the distribution.
++  * 3. Neither the name of the project nor the names of its contributors
++  *    may be used to endorse or promote products derived from this software
++  *    without specific prior written permission.
++  *
++  * THIS SOFTWARE IS PROVIDED BY THE PROJECT AND CONTRIBUTORS ``AS IS'' AND
++  * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++  * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++  * ARE DISCLAIMED.  IN NO EVENT SHALL THE PROJECT OR CONTRIBUTORS BE LIABLE
++  * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++  * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++  * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++  * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++  * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++  * SUCH DAMAGE.
++  */
++ 
++ #include "tcp-full.h"
++ #include "mptcp-full.h"
++ #include "agent.h"
++ #include "node.h"
++ #include "packet.h"
++ #include <vector>
++ 
++ #define MAX_SUBFLOW 100
++ 
++ struct subflow
++ {
++   subflow ():used (false), addr_ (0), port_ (0), daddr_ (-1), dport_ (-1),
++     link_ (NULL), target_ (NULL), tcp_ (NULL), scwnd_ (0)
++   {
++   };
++   bool used;
++   int addr_;
++   int port_;
++   int daddr_;
++   int dport_;
++   NsObject *link_;
++   NsObject *target_;
++   MpFullTcpAgent *tcp_;
++   int dstid_;
++   double scwnd_;
++ };
++ 
++ struct dstinfo
++ {
++   dstinfo ():addr_ (-1), port_ (-1), active_ (false)
++   {
++   };
++   int addr_;
++   int port_;
++   bool active_;
++ };
++ 
++ struct dack_mapping
++ {
++   int ackno;
++   int length;
++ };
++ 
++ class MptcpAgent:public Agent
++ {
++   friend class XcpEndsys;
++   virtual void sendmsg (int nbytes, const char *flags = 0);
++ public:
++     MptcpAgent ();
++    ~MptcpAgent ()
++   {
++   };
++   void delay_bind_init_all ();
++   void recv (Packet * pkt, Handler *);
++   void set_dataack (int ackno, int length);
++   int get_dataack ()
++   {
++     return mackno_;
++   }
++   double get_alpha ()
++   {
++     return alpha_;
++   }
++   double get_totalcwnd ()
++   {
++     totalcwnd_ = 0;
++     for (int i = 0; i < sub_num_; i++) {
++        totalcwnd_ += subflows_[i].tcp_->mptcp_get_cwnd ();
++     }
++     return totalcwnd_;
++   }
++   int command (int argc, const char *const *argv);
++   void calculate_alpha ();
++   TracedInt curseq_;
++ protected:
++   int get_subnum ();
++   int find_subflow (int addr, int port);
++   int find_subflow (int addr);
++   void send_control ();
++   void add_destination (int addr, int port);
++   bool check_routable (int sid, int addr, int port);
++ 
++   Classifier *core_;
++   bool infinite_send_;
++   int sub_num_;
++   int dst_num_;
++   int total_bytes_;
++   int mcurseq_;
++   int mackno_;
++   double totalcwnd_;
++   double alpha_;
++   struct subflow subflows_[MAX_SUBFLOW];
++   struct dstinfo dsts_[MAX_SUBFLOW];
++   vector < dack_mapping > dackmap_;
++ };
+diff -cNr -x .svn ns-2.35.orig/tcp/tcp.h ns-2.35/tcp/tcp.h
+*** ns-2.35.orig/tcp/tcp.h	2013-08-11 01:54:40.857779337 -0700
+--- ns-2.35/tcp/tcp.h	2013-07-29 00:33:04.759632245 -0700
+***************
+*** 55,66 ****
+--- 55,77 ----
+  	int tcp_flags_;         /* TCP flags for FullTcp */
+  	int last_rtt_;		/* more recent RTT measurement in ms, */
+  				/*   for statistics only */
++     /* mptcp */
++     int mp_capable_;
++     int mp_join_;
++     int mp_addr_;
++     int mp_remove_;
++     int mp_dsn_;
++     int mp_subseq_;
++     int mp_dsnlen_;
++     int mp_ack_;
+  
+  	static int offset_;	// offset for this header
+  	inline static int& offset() { return offset_; }
+  	inline static hdr_tcp* access(Packet* p) {
+  		return (hdr_tcp*) p->access(offset_);
+  	}
++ 	int ppseq_;
++ 	int ppid_;
+  
+  	/* per-field member functions */
+  	double& ts() { return (ts_); }
+***************
+*** 74,79 ****
+--- 85,102 ----
+  	int& ackno() { return (ackno_); }  
+  	int& flags() { return (tcp_flags_); }
+  	int& last_rtt() { return (last_rtt_); }
++ 	int& ppseq() { return (ppseq_); }
++ 	int& ppid() { return (ppid_); }
++ 
++     /* mptcp */
++     int& mp_capable() { return (mp_capable_); }
++     int& mp_join() { return (mp_join_); }
++     int& mp_addr() { return (mp_addr_); }
++     int& mp_remove() { return (mp_remove_); }
++     int& mp_dsn() { return (mp_dsn_); }
++     int& mp_subseq() { return (mp_subseq_); }
++     int& mp_dsnlen() { return (mp_dsnlen_); }
++ 	int& mp_ack() { return (mp_ack_); }
+  };
+  
+  /* these are used to mark packets as to why we xmitted them */
+***************
+*** 552,557 ****
+--- 575,581 ----
+  	unsigned int dupwnd_;
+  };
+  
++ 
+  /* TCP New Reno */
+  class NewRenoTcpAgent : public virtual RenoTcpAgent {
+   public:
+***************
+*** 592,597 ****
+--- 616,645 ----
+  				 /* amnt. of data in network) when leaving */
+  };
+  
++ /* TCP PP  */
++ class PPTcpAgent : public virtual NewRenoTcpAgent {
++  public:
++ 	PPTcpAgent();
++ 	virtual void recv(Packet *pkt, Handler*);
++ 	virtual void partialnewack_helper(Packet* pkt);
++ 	virtual void dupack_action();
++  protected:
++ 	virtual void output(int seqno, int reason = 0);
++ 	virtual void send_much(int force, int reason, int maxburst = 0);
++ 	int newreno_changes_;	/* 0 for fixing unnecessary fast retransmits */
++ 	int newreno_changes1_;  /* Newreno_changes1_ set to 0 gives the */
++ 	void partialnewack(Packet *pkt);
++ 	int allow_fast_retransmit(int last_cwnd_action_);
++ 	int acked_, new_ssthresh_;  /* used if newreno_changes_ == 1 */
++ 	double ack2_, ack3_, basertt_; /* used if newreno_changes_ == 1 */
++ 	int firstpartial_; 	/* For the first partial ACK. */ 
++ 	int partial_window_deflation_; /* 0 if set cwnd to ssthresh upon */
++ 	int exit_recovery_fix_;	 /* 0 for setting cwnd to ssthresh upon */
++ 	int pptseq_;
++ 	int ppseq_;
++     int ppid_;
++ };
++ 
+  /* TCP vegas (VegasTcpAgent) */
+  class VegasTcpAgent : public virtual TcpAgent {
+   public:
+diff -cNr -x .svn ns-2.35.orig/trace/trace.cc ns-2.35/trace/trace.cc
+*** ns-2.35.orig/trace/trace.cc	2013-08-11 01:55:10.985780585 -0700
+--- ns-2.35/trace/trace.cc	2013-07-29 00:33:44.671633901 -0700
+***************
+*** 376,381 ****
+--- 376,382 ----
+  			seqno,
+  			th->uid() /* was p->uid_ */);
+  	} else {
++ 	   if (!show_tcphdr_ == 1) {
+  		sprintf(pt_->buffer(), 
+  			"%c "TIME_FORMAT" %d %d %s %d %s %d %s.%s %s.%s %d %d %d 0x%x %d %d",
+  			tt,
+***************
+*** 400,405 ****
+--- 401,445 ----
+  			tcph->flags(),
+  			tcph->hlen(),
+  			tcph->sa_length());
++       } else {
++         char mptcp_str[256];
++         memset(mptcp_str, 0, sizeof(mptcp_str));
++         strcpy(mptcp_str, "-");
++         if (tcph->mp_capable()) mptcp_str[0] = 'M';
++         if (tcph->mp_join()) mptcp_str[0] = 'J';
++         if (tcph->mp_addr()) mptcp_str[0] = 'a';
++         if (tcph->mp_dsn()) {
++             sprintf(mptcp_str,"D %d %d %d", tcph->mp_dsn(), 
++                            tcph->mp_subseq(), tcph->mp_dsnlen()); 
++         } else
++            if (tcph->mp_ack()) sprintf(mptcp_str,"A %d", tcph->mp_ack()); 
++        
++ 		sprintf(pt_->buffer(), 
++ 			"%c "TIME_FORMAT" %d %d %s %d %s %d %s.%s %s.%s %d %d %d 0x%x %d %d %s",
++ 			tt,
++ 			pt_->round(Scheduler::instance().clock()),
++ 			s,
++ 			d,
++ 			name,
++ 			th->size(),
++ 			flags,
++ 			iph->flowid(), /* was p->class_ */
++ 		        // iph->src() >> (Address::instance().NodeShift_[1]), 
++ 			// iph->src() & (Address::instance().PortMask_), 
++   		        // iph->dst() >> (Address::instance().NodeShift_[1]), 
++   		        // iph->dst() & (Address::instance().PortMask_),
++ 			src_nodeaddr,
++ 			src_portaddr,
++ 			dst_nodeaddr,
++ 			dst_portaddr,
++ 			seqno,
++ 			th->uid(), /* was p->uid_ */
++ 			tcph->ackno(),
++ 			tcph->flags(),
++ 			tcph->hlen(),
++ 			tcph->sa_length(),
++             mptcp_str);
++       } 
+  	}
+  	if (pt_->namchannel() != 0)
+  		sprintf(pt_->nbuffer(), 
