@@ -76,7 +76,7 @@ Ns make failed!
 See http://www.isi.edu/nsnam/ns/ns-problems.html for problems
 ```
 
-After search on the internet a while, I find the solution. We should change a file located in the ns2 directory: **`ns-allinone-2.35/ns-2.35/linkstate/ls.h`**, in the **line 137**, we should change the line frome
+After search on the internet for a while, I find the solution. We should change a file located in the ns2 directory: **`ns-allinone-2.35/ns-2.35/linkstate/ls.h`**, in the **line 137**, we should change the line from
 
 ```
 void eraseAll() { erase(baseMap::begin(), baseMap::end()); } 
@@ -134,7 +134,7 @@ And you should use the command to make the change take effect:
 source ~/.bashrc 
 ```
 
-Then you can validate the NS2 as the compile successful message said, buy run **`./invalidate`** in the **`ns-allinone-2.35/ns-2.35`** directory.
+Then you can validate the NS2 as the compile successful message said, by run **`./validate`** in the **`ns-allinone-2.35/ns-2.35`** directory.
 
 > This step may take a long time, because there are so many test examples should been passed. Of course, you can skip this validate step to continue.
 
