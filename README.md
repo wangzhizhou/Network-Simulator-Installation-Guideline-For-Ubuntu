@@ -59,7 +59,7 @@ You should install another software to suppress this fail:
 sudo apt-get install libxt-dev
 ```
 
-Again, run **`sudo run ./intall`**.
+Again, run **`sudo ./install`**.
 
 
 Ops~, you run into the third problem when compile the source file:
