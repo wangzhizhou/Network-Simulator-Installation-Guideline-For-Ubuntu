@@ -1,5 +1,10 @@
 
-> You can checkout my **[repo](https://github.com/wangzhizhou2014GitHub/Network-Simulator-Installation-Guideline-For-Ubuntu)** for this document, and get related files.
+You can checkout my **[repo](https://github.com/wangzhizhou2014GitHub/Network-Simulator-Installation-Guideline-For-Ubuntu)** for this document, and get related files.
+
+```
+sudo apt-get install git-core
+git clone https://github.com/wangzhizhou2014GitHub/Network-Simulator-Installation-Guideline-For-Ubuntu 
+```
 
 ### This Installation of Network Simulator 2 on the Ubuntu 16.04 Live CD UDisk
 
